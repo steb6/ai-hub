@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""ai-usage: remaining quota on the three agent plans (claude-personal, claude-work, codex).
+  ai-usage          table + suggestion
+  ai-usage --json   machine readable
+  ai-usage --check ACCOUNT   exit 1 if ACCOUNT is over the safety threshold
+Cached 60 s in ~/.ai-hub/usage.json."""
+import json, os, sys, time, subprocess, urllib.request
+from datetime import datetime
+from zoneinfo import ZoneInfo
+TZ = ZoneInfo(os.environ.get('AI_HUB_TZ', 'Europe/Rome'))
+H = os.path.expanduser
+CACHE = H('~/.ai-hub/usage.json')
+# percent used that must not be exceeded. The coordinator's account (claude-personal) must
+# never run out; the two work plans may be used up completely.
+LIMITS = {'claude-personal': (85, 90)}
+DEFAULT_LIMIT = (100, 100)
+CLAUDE = {'claude-personal': H('~/.claude'), 'claude-work': H('~/.claude-work')}
+
+def http(url, headers):
+    r = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20)
+    return json.load(r)
+
+def claude(name, cfg, retry=True):
+    c = json.load(open(cfg + '/.credentials.json'))['claudeAiOauth']
+    try:
+        d = http('https://api.anthropic.com/api/oauth/usage',
+                 {'Authorization': 'Bearer ' + c['accessToken'],
+                  'anthropic-beta': 'oauth-2025-04-20', 'User-Agent': 'claude-code'})
+    except Exception:
+        if not retry: raise
+        # token expired: a trivial headless call makes the CLI refresh it
+        env = {k: v for k, v in os.environ.items() if not k.startswith(('CLAUDE', 'ANTHROPIC'))}
+        env['CLAUDE_CONFIG_DIR'] = cfg
+        subprocess.run(['claude', '-p', 'ok', '--model', 'haiku'], env=env,
+                       capture_output=True, timeout=120, cwd='/tmp')
+        return claude(name, cfg, False)
+    ts = lambda s: datetime.fromisoformat(s).timestamp() if s else None
+    return {'plan': c.get('subscriptionType'),
+            'h5': d['five_hour']['utilization'], 'h5_reset': ts(d['five_hour']['resets_at']),
+            'week': d['seven_day']['utilization'], 'week_reset': ts(d['seven_day']['resets_at'])}
+
+def codex():
+    t = json.load(open(H('~/.codex/auth.json')))['tokens']
+    d = http('https://chatgpt.com/backend-api/wham/usage',
+             {'Authorization': 'Bearer ' + t['access_token'],
+              'chatgpt-account-id': t['account_id'], 'User-Agent': 'codex-cli'})
+    p, s = d['rate_limit']['primary_window'], d['rate_limit']['secondary_window']
+    return {'plan': d.get('plan_type'), 'h5': p['used_percent'], 'h5_reset': p['reset_at'],
+            'week': s['used_percent'], 'week_reset': s['reset_at']}
+
+def fetch():
+    try:
+        c = json.load(open(CACHE))
+        if time.time() - c['at'] < 60: return c
+    except Exception: pass
+    out = {'at': time.time(), 'accounts': {}}
+    for n, cfg in CLAUDE.items():
+        try: out['accounts'][n] = claude(n, cfg)
+        except Exception as e: out['accounts'][n] = {'error': str(e)[:80]}
+    try: out['accounts']['codex'] = codex()
+    except Exception as e: out['accounts']['codex'] = {'error': str(e)[:80]}
+    now = time.time()
+    for n, a in out['accounts'].items():
+        if 'error' in a: continue
+        m5, mw = LIMITS.get(n, DEFAULT_LIMIT)
+        left = max((a['week_reset'] or now) - now, 0)
+        a['week_hours_left'] = round(left / 3600, 1)
+        # pace: share of the week already elapsed. used < pace => plan is being wasted
+        a['week_pace'] = round(100 * (1 - left / 604800))
+        a['ok'] = a['h5'] < m5 and a['week'] < mw
+        # what is really usable right now: the tighter of the two windows
+        a['left'] = round(min(100 - a['h5'], 100 - a['week']))
+    json.dump(out, open(CACHE, 'w'))
+    return out
+
+def main():
+    u = fetch(); acc = u['accounts']
+    if '--json' in sys.argv: print(json.dumps(u, indent=1)); return
+    if '--check' in sys.argv:
+        a = acc.get(sys.argv[sys.argv.index('--check') + 1], {})
+        sys.exit(0 if a.get('ok') else 1)
+    fmt = lambda t: datetime.fromtimestamp(t, TZ).strftime('%a %d %H:%M') if t else '-'
+    print(f"{'account':16} {'plan':5} {'5h used':>8} {'reset':>10} {'week used':>10} {'pace':>5} {'reset':>10} {'left':>5}")
+    for n, a in acc.items():
+        if 'error' in a: print(f"{n:16} ERROR {a['error']}"); continue
+        flag = '' if a['ok'] else '  <-- STOP: limit reached'
+        print(f"{n:16} {a['plan'] or '':5} {a['h5']:7.0f}% {fmt(a['h5_reset']):>10} "
+              f"{a['week']:9.0f}% {a['week_pace']:4d}% {fmt(a['week_reset']):>10} {a['left']:4d}%{flag}")
+    ok = {n: a for n, a in acc.items() if a.get('ok')}
+    print('(left = usable now)')
+    if ok:
+        # work plans first (they may be used up), the one with most left; personal only as last resort
+        work = {n: a for n, a in ok.items() if n not in LIMITS} or ok
+        best = max(work, key=lambda n: work[n]['left'])
+        print(f"use next: {best}  (most quota left; claude-personal is kept in reserve)")
+    else:
+        print('\nall accounts over threshold: wait for a reset.')
+main()

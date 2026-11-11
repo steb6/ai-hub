@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# ai-ask: hand a task to another agent account, headless, in the current directory.
+#   ai-ask [-w] [-m MODEL] [-f] <claude-work|claude-personal|codex|auto> "prompt"
+#   -w  allow the agent to edit files / run commands (default: read-only)
+#   -m  model (claude: opus default, fable|sonnet|haiku ; codex: gpt-6-astra default, gpt-5.6-sol|gpt-reserve)
+#   -f  force even if the account reached its limit
+# The answer goes to stdout. Every call is logged in ~/.ai-hub/log.tsv.
+set -euo pipefail
+W=0; M=""; F=0
+while getopts "wm:f" o; do case $o in w) W=1;; m) M=$OPTARG;; f) F=1;; *) exit 2;; esac; done
+shift $((OPTIND-1))
+[ $# -ge 2 ] || { sed -n '2,7p' "$0"; exit 2; }
+A=$1; shift; P="$*"
+HUB=~/.ai-hub
+if [ "$A" = auto ]; then A=$("$HUB/bin/ai-usage" | sed -n 's/^use next: \([a-z-]*\).*/\1/p'); [ -n "$A" ] || { echo "ai-ask: no account available" >&2; exit 3; }; fi
+if [ $F = 0 ] && ! "$HUB/bin/ai-usage" --check "$A"; then
+  echo "ai-ask: $A reached its limit (or is unreadable). Run ai-usage; pick another account or use -f." >&2; exit 3
+fi
+# drop the parent session's variables so the child really uses its own account
+for v in $(env | grep -oE '^(CLAUDE|ANTHROPIC)[A-Z_]*' || true); do unset "$v"; done
+T0=$(date +%s); RC=0
+case $A in
+  claude-work|claude-personal)
+    [ "$A" = claude-work ] && export CLAUDE_CONFIG_DIR=~/.claude-work
+    args=(-p "$P" --model "${M:-opus}")
+    [ $W = 1 ] && args+=(--permission-mode bypassPermissions) || args+=(--permission-mode default)
+    claude "${args[@]}" </dev/null || RC=$? ;;
+  codex)
+    out=$(mktemp)
+    args=(exec --skip-git-repo-check -o "$out" -m "${M:-gpt-6-astra}")
+    [ $W = 1 ] && args+=(-s workspace-write) || args+=(-s read-only)
+    codex "${args[@]}" "$P" </dev/null >/dev/null 2>"$out.err" || { RC=$?; tail -5 "$out.err" >&2; }
+    cat "$out"; rm -f "$out" "$out.err" ;;
+  *) echo "ai-ask: unknown account '$A'" >&2; exit 2 ;;
+esac
+printf '%s\t%s\t%s\t%ss\trc=%s\t%s\t%s\n' "$(date '+%F %T')" "$A" "${M:-default}" "$(( $(date +%s)-T0 ))" "$RC" "$PWD" "${P:0:80}" | tr '\n' ' ' | sed 's/ $/\n/' >> "$HUB/log.tsv"
+rm -f "$HUB/usage.json"   # usage changed: next ai-usage reads fresh
+exit $RC
